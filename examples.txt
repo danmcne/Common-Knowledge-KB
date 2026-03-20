@@ -1,0 +1,480 @@
+-- =============================================================
+-- Common Knowledge KB — Interactive Examples
+-- =============================================================
+-- Run these in psql or any Postgres client.
+-- They progress from simple inspection to Bayesian updates.
+-- =============================================================
+
+-- ── 1. WHAT'S IN THE KB? ─────────────────────────────────────
+
+-- Count everything
+SELECT kind, count(*) AS n
+FROM objects
+GROUP BY kind
+ORDER BY n DESC;
+
+-- List all basis predicates with their domains
+SELECT
+    o.canonical_name,
+    p.arity,
+    p.domains,
+    p.nl_description
+FROM predicates p
+JOIN objects o ON o.id = p.id
+WHERE p.is_basis = true
+ORDER BY p.domains[1], o.canonical_name;
+
+-- Show the full type hierarchy
+SELECT
+    child.canonical_name   AS subtype,
+    parent.canonical_name  AS supertype,
+    round(sb.mean::numeric, 4) AS belief
+FROM statements s
+JOIN statement_belief sb  ON sb.id = s.id
+JOIN objects child        ON child.id  = s.object_args[1]
+JOIN objects parent       ON parent.id = s.object_args[2]
+WHERE s.predicate_id = (
+    SELECT id FROM objects
+    WHERE canonical_name = 'subtype_of' AND kind = 'predicate'
+)
+ORDER BY parent.canonical_name, child.canonical_name;
+
+-- ── 2. BOOLEAN QUERY: "Is a mammal an animal?" ───────────────
+-- Does subtype_of(mammal, animal) hold?
+
+SELECT
+    child.canonical_name  AS subtype,
+    parent.canonical_name AS supertype,
+    round(sb.mean::numeric, 4)      AS belief_mean,
+    round(sb.ci_low::numeric, 4)    AS ci_low,
+    round(sb.ci_high::numeric, 4)   AS ci_high,
+    sb.evidence_strength,
+    s.t_kind
+FROM statements s
+JOIN statement_belief sb  ON sb.id = s.id
+JOIN objects child        ON child.id  = s.object_args[1]
+JOIN objects parent       ON parent.id = s.object_args[2]
+WHERE s.predicate_id = (
+    SELECT id FROM objects WHERE canonical_name='subtype_of' AND kind='predicate'
+)
+AND child.canonical_name  = 'mammal'
+AND parent.canonical_name = 'animal';
+
+-- ── 3. BINDING QUERY: "What is person a subtype of?" ─────────
+-- Returns all supertypes of person.
+
+SELECT
+    parent.canonical_name  AS is_subtype_of,
+    round(sb.mean::numeric, 4)    AS belief,
+    s.t_kind
+FROM statements s
+JOIN statement_belief sb  ON sb.id = s.id
+JOIN objects child        ON child.id  = s.object_args[1]
+JOIN objects parent       ON parent.id = s.object_args[2]
+WHERE s.predicate_id = (
+    SELECT id FROM objects WHERE canonical_name='subtype_of' AND kind='predicate'
+)
+AND child.canonical_name = 'person'
+ORDER BY sb.mean DESC;
+
+-- ── 4. REVERSE BINDING: "What are subtypes of entity?" ───────
+
+SELECT
+    child.canonical_name   AS subtype,
+    round(sb.mean::numeric, 4)     AS belief
+FROM statements s
+JOIN statement_belief sb  ON sb.id = s.id
+JOIN objects child        ON child.id  = s.object_args[1]
+JOIN objects parent       ON parent.id = s.object_args[2]
+WHERE s.predicate_id = (
+    SELECT id FROM objects WHERE canonical_name='subtype_of' AND kind='predicate'
+)
+AND parent.canonical_name = 'entity'
+ORDER BY sb.mean DESC;
+
+-- ── 5. FUZZY TYPICALITY: "How typical is a person as an agent?" ──
+
+SELECT
+    instance.canonical_name  AS instance,
+    type_obj.canonical_name  AS typical_of_type,
+    round(sb.mean::numeric, 4)       AS typicality,
+    round(sb.ci_low::numeric, 4)     AS ci_low,
+    round(sb.ci_high::numeric, 4)    AS ci_high
+FROM statements s
+JOIN statement_belief sb    ON sb.id = s.id
+JOIN objects instance       ON instance.id = s.object_args[1]
+JOIN objects type_obj       ON type_obj.id = s.object_args[2]
+WHERE s.predicate_id = (
+    SELECT id FROM objects WHERE canonical_name='typical_of' AND kind='predicate'
+)
+ORDER BY sb.mean DESC;
+
+-- ── 6. ADD A NEW OBJECT ───────────────────────────────────────
+-- Insert John Tyler as a person.
+
+INSERT INTO objects (kind, canonical_name, display_name, aliases, external_ids)
+VALUES (
+    'person',
+    'john_tyler',
+    'John Tyler',
+    ARRAY['Tyler', 'John Tyler Sr.'],
+    '{"wikidata": "Q11730"}'::jsonb
+)
+RETURNING id;
+
+-- Also add USA and president as concepts (needed for held_office)
+INSERT INTO objects (kind, canonical_name, display_name, external_ids)
+VALUES ('concept', 'usa', 'United States of America',
+        '{"wikidata":"Q30"}'::jsonb)
+ON CONFLICT (canonical_name, kind) DO NOTHING
+RETURNING id;
+
+INSERT INTO objects (kind, canonical_name, display_name)
+VALUES ('concept', 'president', 'President')
+ON CONFLICT (canonical_name, kind) DO NOTHING
+RETURNING id;
+
+-- ── 7. ASSERT: John Tyler was the 10th US president ──────────
+-- Temporal: interval 1841–1845
+-- Source: wikidata (credibility ~0.87 in history domain)
+-- Belief initialised from that credibility.
+
+WITH
+  pred  AS (SELECT id FROM objects WHERE canonical_name='held_office' AND kind='predicate'),
+  tyler AS (SELECT id FROM objects WHERE canonical_name='john_tyler'),
+  pres  AS (SELECT id FROM objects WHERE canonical_name='president'),
+  usa   AS (SELECT id FROM objects WHERE canonical_name='usa'),
+  ctx   AS (SELECT id FROM objects WHERE canonical_name='reality')
+INSERT INTO statements (
+    predicate_id,
+    object_args,
+    literal_args,
+    arg_types,
+    belief_alpha,
+    belief_beta,
+    t_kind,
+    t_start,
+    t_end,
+    context_id,
+    derivation_type
+)
+SELECT
+    pred.id,
+    ARRAY[tyler.id, pres.id, usa.id],
+    '[{"pos":3,"type":"integer","value":10}]'::jsonb,
+    ARRAY['object','object','object','integer'],
+    -- Initial belief: seeded from wikidata credibility mean
+    -- wikidata history alpha=13, beta=2 → mean≈0.867
+    -- We start with equivalent small count: alpha=6.5, beta=1
+    6.5, 1.0,
+    'interval',
+    ROW(year_to_jd(1841), year_to_jd(1840), year_to_jd(1842), 'year')::fuzzy_time,
+    ROW(year_to_jd(1845), year_to_jd(1844), year_to_jd(1846), 'year')::fuzzy_time,
+    ctx.id,
+    'source_ingested'
+FROM pred, tyler, pres, usa, ctx
+RETURNING id;
+
+-- ── 8. ATTEST THE STATEMENT ──────────────────────────────────
+-- Link it to Wikidata as the source.
+
+WITH
+  stmt AS (
+    SELECT s.id FROM statements s
+    JOIN objects p ON p.id = s.predicate_id
+    WHERE p.canonical_name = 'held_office'
+    ORDER BY s.created_at DESC LIMIT 1
+  ),
+  src AS (SELECT id FROM objects WHERE canonical_name='wikidata')
+INSERT INTO attestations (statement_id, source_id, url)
+SELECT stmt.id, src.id,
+       'https://www.wikidata.org/wiki/Q11730'
+FROM stmt, src
+RETURNING id;
+
+-- ── 9. CHECK BELIEF BEFORE ANY UPDATES ───────────────────────
+
+SELECT
+    o.canonical_name           AS predicate,
+    sb.mean                    AS belief_mean,
+    sb.variance                AS belief_variance,
+    sb.ci_low,
+    sb.ci_high,
+    sb.evidence_strength,
+    s.t_kind,
+    s.t_start,
+    s.t_end
+FROM statements s
+JOIN statement_belief sb ON sb.id = s.id
+JOIN objects o           ON o.id  = s.predicate_id
+WHERE o.canonical_name = 'held_office'
+ORDER BY s.created_at DESC
+LIMIT 5;
+
+-- ── 10. TEMPORAL QUERY: "Was Tyler president in 1843?" ───────
+-- Uses the holds_at() function.
+
+SELECT *
+FROM holds_at(
+    (SELECT id FROM objects WHERE canonical_name='held_office' AND kind='predicate'),
+    ARRAY[
+        (SELECT id FROM objects WHERE canonical_name='john_tyler'),
+        (SELECT id FROM objects WHERE canonical_name='president'),
+        (SELECT id FROM objects WHERE canonical_name='usa')
+    ],
+    '1843-06-15 00:00:00+00'::timestamptz,
+    (SELECT id FROM objects WHERE canonical_name='reality')
+);
+-- Returns: statement_id, belief_mean≈0.867, evidence_strength=7.5
+
+-- ── 11. TEMPORAL QUERY: "Was Tyler president in 1850?" ───────
+-- Should return empty (after his term ended).
+
+SELECT *
+FROM holds_at(
+    (SELECT id FROM objects WHERE canonical_name='held_office' AND kind='predicate'),
+    ARRAY[
+        (SELECT id FROM objects WHERE canonical_name='john_tyler'),
+        (SELECT id FROM objects WHERE canonical_name='president'),
+        (SELECT id FROM objects WHERE canonical_name='usa')
+    ],
+    '1850-01-01 00:00:00+00'::timestamptz,
+    (SELECT id FROM objects WHERE canonical_name='reality')
+);
+-- Returns: empty — Tyler was not president in 1850.
+
+-- ── 12. BAYESIAN UPDATE: a second source confirms the fact ───
+-- Suppose we find a history textbook (moderate credibility)
+-- that also confirms Tyler was the 10th president.
+-- We first add it as a source, then update belief.
+
+INSERT INTO objects (kind, canonical_name, display_name, description)
+VALUES ('source', 'american_history_textbook',
+        'American History Textbook',
+        'Generic American history textbook; moderate credibility')
+ON CONFLICT (canonical_name, kind) DO NOTHING;
+
+-- Give it a credibility prior in the history domain
+INSERT INTO source_credibility (source_id, context_id, alpha, beta)
+VALUES (
+    (SELECT id FROM objects WHERE canonical_name='american_history_textbook'),
+    (SELECT id FROM objects WHERE canonical_name='domain_history'),
+    8.0, 2.0   -- mean = 0.80, moderate-high
+)
+ON CONFLICT DO NOTHING;
+
+-- Attest the Tyler statement from this new source
+WITH
+  stmt AS (
+    SELECT s.id FROM statements s
+    JOIN objects p ON p.id = s.predicate_id
+    WHERE p.canonical_name = 'held_office'
+    ORDER BY s.created_at DESC LIMIT 1
+  ),
+  src AS (SELECT id FROM objects WHERE canonical_name='american_history_textbook')
+INSERT INTO attestations (statement_id, source_id)
+SELECT stmt.id, src.id FROM stmt, src;
+
+-- Now update the belief: source credibility mean = 8/(8+2) = 0.80
+SELECT update_belief(
+    (SELECT s.id FROM statements s
+     JOIN objects p ON p.id = s.predicate_id
+     WHERE p.canonical_name = 'held_office'
+     ORDER BY s.created_at DESC LIMIT 1),
+    0.80,   -- textbook credibility mean
+    true    -- it supports the claim
+);
+
+-- Check belief after update: alpha should now be ~7.3, mean higher
+SELECT
+    round(sb.mean::numeric, 4)            AS belief_mean,
+    round(sb.ci_low::numeric, 4)          AS ci_low,
+    round(sb.ci_high::numeric, 4)         AS ci_high,
+    round(sb.evidence_strength::numeric,2) AS evidence_strength,
+    round(sb.variance::numeric, 6)        AS variance
+FROM statements s
+JOIN statement_belief sb ON sb.id = s.id
+JOIN objects p           ON p.id  = s.predicate_id
+WHERE p.canonical_name = 'held_office'
+ORDER BY s.created_at DESC LIMIT 1;
+-- mean rises from ~0.867 to ~0.878 — small update because
+-- evidence_strength was already 7.5; new evidence adds 0.80.
+
+-- ── 13. BAYESIAN UPDATE: a source contradicts ────────────────
+-- Suppose a poorly-researched source claims Tyler was the 11th
+-- president (wrong). We add the correct statement as negated=true
+-- and update the belief downward.
+-- More realistically: we refute the claim and update trust.
+
+-- Simulate: a bad source asserts something contradictory.
+-- We penalise it by calling update_trust with correct=false.
+SELECT update_trust(
+    (SELECT id FROM objects WHERE canonical_name='llm_generated'),
+    (SELECT id FROM objects WHERE canonical_name='domain_history'),
+    false   -- it got something wrong in history
+);
+
+-- Check llm_generated credibility in history after penalty
+SELECT
+    o.canonical_name                       AS source,
+    c.canonical_name                       AS context,
+    round(scs.mean::numeric, 4)            AS credibility_mean,
+    round(scs.ci_low::numeric, 4)          AS ci_low,
+    round(scs.ci_high::numeric, 4)         AS ci_high,
+    round(scs.evidence_strength::numeric,1) AS evidence_strength
+FROM source_credibility_score scs
+JOIN objects o ON o.id = scs.source_id
+JOIN objects c ON c.id = scs.context_id
+ORDER BY scs.mean DESC;
+
+-- ── 14. ADD A DERIVED STATEMENT ──────────────────────────────
+-- "Tyler was president of the USA" (without ordinal) —
+-- derived from the more specific held_office statement.
+
+WITH
+  pred  AS (SELECT id FROM objects WHERE canonical_name='held_office' AND kind='predicate'),
+  tyler AS (SELECT id FROM objects WHERE canonical_name='john_tyler'),
+  pres  AS (SELECT id FROM objects WHERE canonical_name='president'),
+  usa   AS (SELECT id FROM objects WHERE canonical_name='usa'),
+  ctx   AS (SELECT id FROM objects WHERE canonical_name='reality'),
+  src_stmt AS (
+    SELECT s.id FROM statements s
+    JOIN objects p ON p.id = s.predicate_id
+    WHERE p.canonical_name = 'held_office'
+    ORDER BY s.created_at DESC LIMIT 1
+  )
+INSERT INTO statements (
+    predicate_id, object_args, literal_args, arg_types,
+    belief_alpha, belief_beta,
+    t_kind, t_start, t_end,
+    context_id, derivation_type, derivation_depth, derived_from
+)
+SELECT
+    pred.id,
+    ARRAY[tyler.id, pres.id, usa.id],
+    '[]'::jsonb,
+    ARRAY['object','object','object'],
+    -- Inherit belief from parent statement (slightly discounted)
+    7.0, 1.0,
+    'interval',
+    ROW(year_to_jd(1841), year_to_jd(1840), year_to_jd(1842), 'year')::fuzzy_time,
+    ROW(year_to_jd(1845), year_to_jd(1844), year_to_jd(1846), 'year')::fuzzy_time,
+    ctx.id,
+    'forward_chained',
+    1,                       -- depth 1: one inference step from axiomatic source
+    ARRAY[src_stmt.id]       -- derived_from the specific statement
+FROM pred, tyler, pres, usa, ctx, src_stmt
+RETURNING id;
+
+-- ── 15. QUERY WITH PROVENANCE ─────────────────────────────────
+-- Show all held_office statements with their sources and belief.
+
+SELECT
+    o_pred.canonical_name          AS predicate,
+    s.object_args,
+    s.literal_args,
+    round(sb.mean::numeric, 4)     AS belief_mean,
+    s.t_kind,
+    s.derivation_type,
+    s.derivation_depth,
+    array_agg(o_src.canonical_name) AS sources
+FROM statements s
+JOIN statement_belief sb  ON sb.id = s.id
+JOIN objects o_pred       ON o_pred.id = s.predicate_id
+LEFT JOIN attestations a  ON a.statement_id = s.id
+LEFT JOIN objects o_src   ON o_src.id = a.source_id
+WHERE o_pred.canonical_name = 'held_office'
+GROUP BY s.id, o_pred.canonical_name, s.object_args,
+         s.literal_args, sb.mean, s.t_kind,
+         s.derivation_type, s.derivation_depth
+ORDER BY s.created_at;
+
+-- ── 16. FIND CONFLICTS (if any) ───────────────────────────────
+-- Check if we have two contradictory held_office statements
+-- for the same args. (Manual conflict detection example.)
+
+WITH office_stmts AS (
+    SELECT
+        s.id,
+        s.object_args,
+        s.literal_args,
+        s.negated,
+        sb.mean AS belief
+    FROM statements s
+    JOIN statement_belief sb ON sb.id = s.id
+    JOIN objects p ON p.id = s.predicate_id
+    WHERE p.canonical_name = 'held_office'
+)
+SELECT
+    a.id   AS stmt_a,
+    b.id   AS stmt_b,
+    a.object_args,
+    a.negated  AS a_negated,
+    b.negated  AS b_negated,
+    round(a.belief::numeric,4) AS a_belief,
+    round(b.belief::numeric,4) AS b_belief
+FROM office_stmts a
+JOIN office_stmts b
+    ON  a.object_args = b.object_args
+    AND a.id < b.id
+    AND a.negated != b.negated;   -- direct contradiction
+
+-- ── 17. AGGREGATE: Statement counts by type ──────────────────
+
+SELECT
+    t_kind,
+    derivation_type,
+    count(*)                              AS n_statements,
+    round(avg(sb.mean)::numeric, 4)       AS avg_belief,
+    round(avg(sb.evidence_strength)::numeric, 2) AS avg_evidence
+FROM statements s
+JOIN statement_belief sb ON sb.id = s.id
+GROUP BY t_kind, derivation_type
+ORDER BY t_kind, derivation_type;
+
+-- ── 18. INTROSPECT: What does the KB believe about "person"? ──
+-- All statements in which 'person' appears as any argument.
+
+SELECT
+    p.canonical_name                   AS predicate,
+    array_agg(o.canonical_name ORDER BY idx) AS args,
+    round(sb.mean::numeric, 4)         AS belief,
+    s.t_kind
+FROM statements s
+JOIN statement_belief sb ON sb.id = s.id
+JOIN objects p           ON p.id  = s.predicate_id
+JOIN LATERAL unnest(s.object_args) WITH ORDINALITY AS u(arg_id, idx) ON true
+JOIN objects o           ON o.id  = u.arg_id
+WHERE EXISTS (
+    SELECT 1 FROM unnest(s.object_args) arg_id
+    WHERE arg_id = (SELECT id FROM objects WHERE canonical_name='person')
+)
+GROUP BY s.id, p.canonical_name, sb.mean, s.t_kind
+ORDER BY sb.mean DESC;
+
+-- ── 19. PYTHON EQUIVALENT (reference) ────────────────────────
+-- If you are connecting via psycopg2 or asyncpg, the pattern is:
+--
+-- import psycopg2, json
+-- conn = psycopg2.connect("dbname=your_database")
+-- cur  = conn.cursor()
+--
+-- # Boolean query
+-- cur.execute("""
+--     SELECT sb.mean, sb.ci_low, sb.ci_high
+--     FROM statements s
+--     JOIN statement_belief sb ON sb.id = s.id
+--     WHERE s.predicate_id = (
+--         SELECT id FROM objects WHERE canonical_name=%s AND kind='predicate')
+--     AND s.object_args[1] = (
+--         SELECT id FROM objects WHERE canonical_name=%s)
+--     AND s.object_args[2] = (
+--         SELECT id FROM objects WHERE canonical_name=%s)
+-- """, ('subtype_of', 'mammal', 'animal'))
+-- row = cur.fetchone()
+-- print(f"P(mammal subtype_of animal) = {row[0]:.4f}  [{row[1]:.4f}, {row[2]:.4f}]")
+--
+-- # Bayesian update after verification
+-- cur.execute("SELECT update_belief(%s, %s, %s)",
+--             (statement_id, 0.87, True))
+-- conn.commit()
