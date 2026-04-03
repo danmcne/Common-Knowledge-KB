@@ -1,0 +1,1783 @@
+-- =============================================================
+-- Common Knowledge KB — Interactive Examples (v0.7)
+-- =============================================================
+-- Demonstrates schema, predicates, and objects kernel usage.
+-- Run after all three kernel files in order:
+--   1. common_knowledge_schema.sql
+--   2. common_predicates_kernel.sql
+--   3. common_objects_kernel.sql
+--
+-- v0.7 changes in these examples:
+--
+--   statement_kind COLUMN  [Fix #17]
+--     All INSERT INTO statements blocks now include statement_kind.
+--     New A8 queries statement counts by kind. C2 shows 'empirical'
+--     for user-asserted individual facts. G1 shows 'empirical' on the
+--     contradictory claim. F1 shows 'empirical' on the derived statement.
+--     The effective_mean in tells and queries now gates out 'rule'
+--     statements automatically.
+--
+--   located_in USES no_period  [Fix #23]
+--     C7 updated: third arg of located_in changed from no_scope to
+--     no_period. no_scope is restricted to role-scope arguments.
+--     no_period is the correct sentinel when no named period is the
+--     semantic argument of a spatial predicate.
+--
+--   INVERSE PREDICATE AUTOMATION  [Fix #24]
+--     C9 (new): demonstrates that inserting part_of(difference_engine,
+--     babbage_workshop) automatically creates has_part(babbage_workshop,
+--     difference_engine) as a forward_chained statement via the
+--     trg_zz_auto_inverse_statement trigger.
+--
+--   CONFLICT SEVERITY  [Fix #19] + EFFECTIVE BELIEF  [Fix #20]
+--     G2 updated: conflict inspection query now shows severity (the
+--     normalised CI gap). H1 and H2 updated to use the new
+--     statement_effective_belief view, showing effective_mean alongside
+--     raw_mean and conflict penalty. G6 (new): demonstrates that an
+--     open high-severity conflict suppresses effective_mean.
+--
+--   log_odds COMBINATION FIX  [Fix #21]
+--     F2 comment updated: log_odds now correctly ACCUMULATES (sums)
+--     log-odds rather than averaging. Two independent near-certain
+--     parents produce a result above 0.9, not equal to it.
+--
+--   tell_about() WITH p_time  [Fix #25]
+--     H4 updated: demonstrates the new p_time parameter to retrieve
+--     what was true about an entity at a specific historical moment.
+--     H3 updated to use new tell_about() return columns (effective_mean,
+--     raw_mean, open_conflict_count, statement_kind).
+--
+--   trg_z_soft_domain_check FIRES ON UPDATE  [Fix #22]
+--     G5 extended: shows that updating object_args to an invalid value
+--     post-insertion also triggers the soft domain check.
+--
+-- =============================================================
+
+
+-- ════════════════════════════════════════════════════════════
+-- PART A: INSPECTION
+-- ════════════════════════════════════════════════════════════
+
+-- ── A1. Object counts by kind ────────────────────────────────
+
+SELECT kind, count(*) AS n
+FROM objects
+GROUP BY kind
+ORDER BY n DESC;
+
+
+-- ── A2. All basis predicates — arity, strictness, inverse ────
+-- Includes inverse column (new in v0.7 predicates kernel).
+
+SELECT
+    o.canonical_name            AS predicate,
+    p.arity,
+    CASE p.arity
+        WHEN 1 THEN 'unary'
+        WHEN 2 THEN 'binary'
+        WHEN 3 THEN 'ternary'
+        ELSE        'higher-order'
+    END                         AS arg_structure,
+    p.arg_labels,
+    p.domain_strictness,
+    CASE WHEN p.inverse_predicate_id IS NOT NULL
+         THEN inv.canonical_name
+         ELSE NULL
+    END                         AS inverse,
+    p.nl_description
+FROM predicates p
+JOIN objects o ON o.id = p.id
+LEFT JOIN objects inv ON inv.id = p.inverse_predicate_id
+WHERE p.is_basis = true
+ORDER BY p.arity, o.canonical_name;
+-- Expect: before/after, part_of/has_part, contains/part_of show inverse names.
+
+
+-- ── A3. Full type hierarchy with effective belief ────────────
+-- Uses statement_effective_belief (v0.7) for effective_mean.
+
+SELECT
+    child.canonical_name                       AS subtype,
+    parent.canonical_name                      AS supertype,
+    round(seb.effective_mean::numeric, 4)      AS effective_belief,
+    round(seb.raw_mean::numeric, 4)            AS raw_belief,
+    s.t_kind,
+    s.statement_kind
+FROM statements s
+JOIN statement_effective_belief seb ON seb.id     = s.id
+JOIN objects child                  ON child.id   = s.object_args[1]
+JOIN objects parent                 ON parent.id  = s.object_args[2]
+WHERE s.predicate_id = stable_uuid('subtype_of', 'predicate')
+ORDER BY parent.canonical_name, child.canonical_name;
+
+
+-- ── A4. All disjointness axioms with severity potential ───────
+-- abstract ⊥ concrete and their immediate children.
+
+SELECT
+    a.canonical_name                           AS type_a,
+    b.canonical_name                           AS type_b,
+    round(seb.effective_mean::numeric, 4)      AS effective_belief,
+    s.statement_kind
+FROM statements s
+JOIN statement_effective_belief seb ON seb.id = s.id
+JOIN objects a                      ON a.id   = s.object_args[1]
+JOIN objects b                      ON b.id   = s.object_args[2]
+WHERE s.predicate_id = stable_uuid('disjoint_with', 'predicate')
+ORDER BY type_a, type_b;
+-- Expect: 27 rows; all statement_kind = 'ontological'.
+
+
+-- ── A5. Source credibility priors ────────────────────────────
+
+SELECT
+    o.canonical_name                          AS source,
+    c.canonical_name                          AS context,
+    round(scs.mean::numeric, 4)               AS credibility_mean,
+    round(scs.ci_low::numeric, 4)             AS ci_low,
+    round(scs.ci_high::numeric, 4)            AS ci_high,
+    round(scs.evidence_strength::numeric, 1)  AS evidence_strength,
+    scs.is_protected
+FROM source_credibility_score scs
+JOIN objects o ON o.id = scs.source_id
+JOIN objects c ON c.id = scs.context_id
+ORDER BY scs.mean DESC;
+
+
+-- ── A6. type_membership cache — confirm trigger-derived rows ──
+-- Populated by trg_sync_type_membership, never by direct inserts.
+-- After common_objects_kernel.sql is applied, expect 25+ rows.
+
+SELECT
+    obj.canonical_name  AS object,
+    typ.canonical_name  AS type,
+    round((tm.alpha / (tm.alpha + tm.beta))::numeric, 4) AS belief
+FROM type_membership tm
+JOIN objects obj ON obj.id = tm.object_id
+JOIN objects typ ON typ.id = tm.type_id
+ORDER BY obj.canonical_name, typ.canonical_name;
+
+
+-- ── A7. Role subtypes ─────────────────────────────────────────
+-- mathematician, programmer, inventor etc. seeded as subtype_of(X, role)
+-- in common_objects_kernel.sql. [Fix #22] is_a rows for these are NOT
+-- in the objects kernel — subtype_of alone is sufficient with recursive
+-- CTE domain enforcement.
+
+SELECT
+    child.canonical_name                       AS role_subtype,
+    parent.canonical_name                      AS parent,
+    round(seb.effective_mean::numeric, 4)      AS belief,
+    s.statement_kind
+FROM statements s
+JOIN statement_effective_belief seb ON seb.id     = s.id
+JOIN objects child                  ON child.id   = s.object_args[1]
+JOIN objects parent                 ON parent.id  = s.object_args[2]
+WHERE s.predicate_id        = stable_uuid('subtype_of', 'predicate')
+  AND parent.canonical_name = 'role'
+ORDER BY child.canonical_name;
+-- Expect: artist, engineer, inventor, mathematician, politician,
+--         programmer, scientist, teacher — all belief ≈ 1.0,
+--         statement_kind = 'ontological'.
+
+
+-- ── A8. [Fix #17] Statement counts by statement_kind ─────────
+-- New in v0.7: shows distribution across ontological, empirical,
+-- statistical, and rule statements.
+
+SELECT
+    statement_kind,
+    count(*)                                   AS n_statements,
+    round(avg(seb.effective_mean)::numeric, 4) AS avg_effective_belief
+FROM statements s
+JOIN statement_effective_belief seb ON seb.id = s.id
+GROUP BY statement_kind
+ORDER BY statement_kind;
+-- Expect: ontological (majority), statistical (typicality), rule (FOL rules).
+
+
+-- ════════════════════════════════════════════════════════════
+-- PART B: SIMPLE QUERIES ON KERNEL CONTENT
+-- ════════════════════════════════════════════════════════════
+
+-- ── B1. Boolean: "Is a mammal an animal?" ────────────────────
+
+SELECT
+    child.canonical_name                       AS subtype,
+    parent.canonical_name                      AS supertype,
+    round(seb.effective_mean::numeric, 4)      AS effective_belief,
+    round(seb.raw_mean::numeric, 4)            AS raw_belief,
+    s.t_kind
+FROM statements s
+JOIN statement_effective_belief seb ON seb.id     = s.id
+JOIN objects child                  ON child.id   = s.object_args[1]
+JOIN objects parent                 ON parent.id  = s.object_args[2]
+WHERE s.predicate_id        = stable_uuid('subtype_of', 'predicate')
+  AND child.canonical_name  = 'mammal'
+  AND parent.canonical_name = 'animal';
+-- Expect: effective_belief ≈ 1.0000, t_kind = 'eternal'
+
+
+-- ── B2. Binding: "What is person a subtype of?" ──────────────
+
+SELECT
+    parent.canonical_name                      AS is_subtype_of,
+    round(seb.effective_mean::numeric, 4)      AS belief,
+    s.t_kind
+FROM statements s
+JOIN statement_effective_belief seb ON seb.id     = s.id
+JOIN objects child                  ON child.id   = s.object_args[1]
+JOIN objects parent                 ON parent.id  = s.object_args[2]
+WHERE s.predicate_id       = stable_uuid('subtype_of', 'predicate')
+  AND child.canonical_name = 'person'
+ORDER BY seb.effective_mean DESC;
+-- Expect: mammal, agent (both near-certain, eternal)
+
+
+-- ── B3. Reverse binding: "What are direct subtypes of entity?" ─
+
+SELECT
+    child.canonical_name                       AS subtype,
+    round(seb.effective_mean::numeric, 4)      AS belief
+FROM statements s
+JOIN statement_effective_belief seb ON seb.id     = s.id
+JOIN objects child                  ON child.id   = s.object_args[1]
+JOIN objects parent                 ON parent.id  = s.object_args[2]
+WHERE s.predicate_id        = stable_uuid('subtype_of', 'predicate')
+  AND parent.canonical_name = 'entity'
+ORDER BY seb.effective_mean DESC;
+
+
+-- ── B4. Typicality: all typical_of statements ranked ─────────
+-- [Fix #17] All typicality statements have statement_kind = 'statistical'.
+-- They are excluded from logical inference chains but visible here directly.
+
+SELECT
+    instance.canonical_name                    AS instance,
+    type_obj.canonical_name                    AS typical_of,
+    round(seb.effective_mean::numeric, 4)      AS typicality,
+    s.statement_kind
+FROM statements s
+JOIN statement_effective_belief seb ON seb.id      = s.id
+JOIN objects instance               ON instance.id = s.object_args[1]
+JOIN objects type_obj               ON type_obj.id = s.object_args[2]
+WHERE s.predicate_id  = stable_uuid('typical_of', 'predicate')
+ORDER BY seb.effective_mean DESC;
+-- Expect: person→agent highest (~0.90); all statement_kind = 'statistical'.
+
+
+-- ── B5. Check a disjointness: "Are numbers and organisms disjoint?" ─
+
+SELECT
+    a.canonical_name                           AS type_a,
+    b.canonical_name                           AS type_b,
+    round(seb.effective_mean::numeric, 4)      AS belief,
+    s.t_kind
+FROM statements s
+JOIN statement_effective_belief seb ON seb.id = s.id
+JOIN objects a                      ON a.id   = s.object_args[1]
+JOIN objects b                      ON b.id   = s.object_args[2]
+WHERE s.predicate_id     = stable_uuid('disjoint_with', 'predicate')
+  AND a.canonical_name   = 'number'
+  AND b.canonical_name   = 'organism';
+-- Expect: belief ≈ 1.0000
+
+
+-- ── B6. Check person-institution disjointness (graded) ───────
+
+SELECT
+    a.canonical_name                           AS type_a,
+    b.canonical_name                           AS type_b,
+    round(seb.effective_mean::numeric, 4)      AS belief,
+    round(seb.raw_mean::numeric, 4)            AS raw_mean
+FROM statements s
+JOIN statement_effective_belief seb ON seb.id = s.id
+JOIN objects a                      ON a.id   = s.object_args[1]
+JOIN objects b                      ON b.id   = s.object_args[2]
+WHERE s.predicate_id     = stable_uuid('disjoint_with', 'predicate')
+  AND a.canonical_name   = 'person'
+  AND b.canonical_name   = 'institution';
+-- Expect: belief ≈ 0.90 (not near-certain: sole-trader edge case)
+
+
+-- ════════════════════════════════════════════════════════════
+-- PART C: INSERTING INDIVIDUALS AND ASSERTING FACTS
+-- ════════════════════════════════════════════════════════════
+-- Named individuals use kind = 'entity' and stable_uuid(name,'entity').
+-- Type information lives in is_a statements, which fire
+-- trg_sync_type_membership and populate type_membership automatically.
+-- Do NOT insert into type_membership directly.
+--
+-- mathematician, programmer, inventor are seeded in common_objects_kernel.sql
+-- as subtypes of role. Do not re-insert them here. Reference them via
+-- stable_uuid(name,'entity') directly.
+
+-- ── C1. Insert named individuals ─────────────────────────────
+
+INSERT INTO objects (id, kind, canonical_name, display_name, aliases, external_ids)
+VALUES (
+    stable_uuid('ada_lovelace', 'entity'),
+    'entity', 'ada_lovelace', 'Ada Lovelace',
+    ARRAY['Augusta Ada King', 'Countess of Lovelace', 'Ada Byron'],
+    '{"wikidata":"Q7259"}'::jsonb
+) ON CONFLICT (canonical_name, kind) DO NOTHING;
+
+INSERT INTO objects (id, kind, canonical_name, display_name, aliases, external_ids)
+VALUES (
+    stable_uuid('charles_babbage', 'entity'),
+    'entity', 'charles_babbage', 'Charles Babbage',
+    ARRAY['Babbage'],
+    '{"wikidata":"Q46884"}'::jsonb
+) ON CONFLICT (canonical_name, kind) DO NOTHING;
+
+INSERT INTO objects (id, kind, canonical_name, display_name, description, external_ids)
+VALUES (
+    stable_uuid('difference_engine', 'entity'),
+    'entity', 'difference_engine', 'Difference Engine',
+    'Mechanical general-purpose computer designed by Charles Babbage.',
+    '{"wikidata":"Q181348"}'::jsonb
+) ON CONFLICT (canonical_name, kind) DO NOTHING;
+
+INSERT INTO objects (id, kind, canonical_name, display_name, external_ids)
+VALUES (
+    stable_uuid('university_of_cambridge', 'entity'),
+    'entity', 'university_of_cambridge', 'University of Cambridge',
+    '{"wikidata":"Q35794"}'::jsonb
+) ON CONFLICT (canonical_name, kind) DO NOTHING;
+
+INSERT INTO objects (id, kind, canonical_name, display_name, external_ids)
+VALUES (
+    stable_uuid('london', 'entity'),
+    'entity', 'london', 'London',
+    '{"wikidata":"Q84"}'::jsonb
+) ON CONFLICT (canonical_name, kind) DO NOTHING;
+
+
+-- ── C2. Assert types via is_a statements ─────────────────────
+-- is_a statements are the canonical type mechanism.
+-- trg_sync_type_membership fires automatically and populates
+-- type_membership. Do NOT insert into type_membership directly.
+-- [Fix #17] statement_kind = 'empirical' for individual classifications.
+
+-- ada_lovelace is_a person
+INSERT INTO statements (
+    predicate_id, object_args,
+    belief_alpha, belief_beta,
+    statement_kind, t_kind, context_id, derivation_type
+) VALUES (
+    stable_uuid('is_a',    'predicate'),
+    ARRAY[
+        stable_uuid('ada_lovelace', 'entity'),
+        stable_uuid('person',       'entity')
+    ],
+    1000.0, 0.001,
+    'empirical', 'eternal',
+    stable_uuid('reality', 'context'),
+    'user_asserted'
+) ON CONFLICT DO NOTHING;
+
+-- charles_babbage is_a person
+INSERT INTO statements (
+    predicate_id, object_args,
+    belief_alpha, belief_beta,
+    statement_kind, t_kind, context_id, derivation_type
+) VALUES (
+    stable_uuid('is_a',    'predicate'),
+    ARRAY[
+        stable_uuid('charles_babbage', 'entity'),
+        stable_uuid('person',          'entity')
+    ],
+    1000.0, 0.001,
+    'empirical', 'eternal',
+    stable_uuid('reality', 'context'),
+    'user_asserted'
+) ON CONFLICT DO NOTHING;
+
+-- difference_engine is_a artifact
+INSERT INTO statements (
+    predicate_id, object_args,
+    belief_alpha, belief_beta,
+    statement_kind, t_kind, context_id, derivation_type
+) VALUES (
+    stable_uuid('is_a',     'predicate'),
+    ARRAY[
+        stable_uuid('difference_engine', 'entity'),
+        stable_uuid('artifact',          'entity')
+    ],
+    1000.0, 0.001,
+    'empirical', 'eternal',
+    stable_uuid('reality', 'context'),
+    'user_asserted'
+) ON CONFLICT DO NOTHING;
+
+-- university_of_cambridge is_a institution
+INSERT INTO statements (
+    predicate_id, object_args,
+    belief_alpha, belief_beta,
+    statement_kind, t_kind, context_id, derivation_type
+) VALUES (
+    stable_uuid('is_a',     'predicate'),
+    ARRAY[
+        stable_uuid('university_of_cambridge', 'entity'),
+        stable_uuid('institution',             'entity')
+    ],
+    1000.0, 0.001,
+    'empirical', 'eternal',
+    stable_uuid('reality', 'context'),
+    'user_asserted'
+) ON CONFLICT DO NOTHING;
+
+-- Attest the ada_lovelace is_a person statement.
+WITH stmt AS (
+    SELECT id FROM statements
+    WHERE predicate_id = stable_uuid('is_a', 'predicate')
+      AND object_args  = ARRAY[
+            stable_uuid('ada_lovelace', 'entity'),
+            stable_uuid('person',       'entity')]
+)
+INSERT INTO attestations (statement_id, source_id, url)
+SELECT stmt.id,
+       stable_uuid('wikidata', 'source'),
+       'https://www.wikidata.org/wiki/Q7259'
+FROM stmt
+ON CONFLICT DO NOTHING;
+
+-- Verify that type_membership was populated by the trigger.
+SELECT
+    obj.canonical_name  AS object,
+    typ.canonical_name  AS type,
+    round((tm.alpha / (tm.alpha + tm.beta))::numeric, 4) AS belief
+FROM type_membership tm
+JOIN objects obj ON obj.id = tm.object_id
+JOIN objects typ ON typ.id = tm.type_id
+WHERE obj.canonical_name IN (
+    'ada_lovelace','charles_babbage','difference_engine','university_of_cambridge'
+)
+ORDER BY obj.canonical_name, typ.canonical_name;
+-- Expect: 4 rows populated by trg_sync_type_membership, not manually.
+
+
+-- ── C3. Assert: Ada Lovelace held role "mathematician" ────────
+-- has_role(entity, role, scope) — ternary.
+-- no_scope: the role genuinely has no institutional scope.
+-- Ada worked independently — that is structurally different from
+-- "scope unknown".
+
+INSERT INTO statements (
+    predicate_id, object_args,
+    belief_alpha, belief_beta,
+    statement_kind, t_kind, context_id, derivation_type
+) VALUES (
+    stable_uuid('has_role', 'predicate'),
+    ARRAY[
+        stable_uuid('ada_lovelace',  'entity'),
+        stable_uuid('mathematician', 'entity'),
+        stable_uuid('no_scope',      'entity')   -- unscoped, not unknown
+    ],
+    13.0, 2.0,
+    'empirical', 'always',
+    stable_uuid('reality', 'context'),
+    'source_ingested'
+);
+
+WITH stmt AS (
+    SELECT id FROM statements
+    WHERE predicate_id   = stable_uuid('has_role', 'predicate')
+      AND object_args[1] = stable_uuid('ada_lovelace',  'entity')
+      AND object_args[2] = stable_uuid('mathematician', 'entity')
+    ORDER BY created_at DESC LIMIT 1
+)
+INSERT INTO attestations (statement_id, source_id, url)
+SELECT stmt.id,
+       stable_uuid('wikidata', 'source'),
+       'https://www.wikidata.org/wiki/Q7259'
+FROM stmt;
+
+
+-- ── C4. Assert: Lovelace held role "programmer" at Difference Engine ─
+-- Temporal interval: approximately 1842–1843 (the Notes translation).
+-- The scope is the difference_engine itself — a real semantic argument.
+
+INSERT INTO statements (
+    predicate_id, object_args,
+    belief_alpha, belief_beta,
+    statement_kind, t_kind, t_start, t_end,
+    context_id, derivation_type
+) VALUES (
+    stable_uuid('has_role', 'predicate'),
+    ARRAY[
+        stable_uuid('ada_lovelace',      'entity'),
+        stable_uuid('programmer',        'entity'),
+        stable_uuid('difference_engine', 'entity')
+    ],
+    13.0, 2.0,
+    'empirical', 'interval',
+    ROW(year_to_jd(1842), year_to_jd(1841), year_to_jd(1843), 'year')::fuzzy_time,
+    ROW(year_to_jd(1843), year_to_jd(1842), year_to_jd(1845), 'year')::fuzzy_time,
+    stable_uuid('reality', 'context'),
+    'source_ingested'
+);
+
+
+-- ── C5. Assert: Babbage created the Difference Engine ─────────
+
+INSERT INTO statements (
+    predicate_id, object_args,
+    belief_alpha, belief_beta,
+    statement_kind, t_kind, context_id, derivation_type
+) VALUES (
+    stable_uuid('created_by', 'predicate'),
+    ARRAY[
+        stable_uuid('difference_engine', 'entity'),
+        stable_uuid('charles_babbage',   'entity')
+    ],
+    13.0, 2.0,
+    'empirical', 'always',
+    stable_uuid('reality', 'context'),
+    'source_ingested'
+);
+
+
+-- ── C6. Assert: Babbage affiliated with Cambridge ─────────────
+-- Babbage was Lucasian Professor of Mathematics 1828–1839.
+-- Temporal scope in t_start/t_end; capacity arg is the named role.
+
+INSERT INTO objects (id, kind, canonical_name, display_name, description)
+VALUES (
+    stable_uuid('lucasian_professor', 'entity'),
+    'entity', 'lucasian_professor', 'Lucasian Professor of Mathematics',
+    'The Lucasian Chair of Mathematics at the University of Cambridge.'
+) ON CONFLICT (canonical_name, kind) DO NOTHING;
+
+INSERT INTO statements (
+    predicate_id, object_args,
+    belief_alpha, belief_beta,
+    statement_kind, t_kind, t_start, t_end,
+    context_id, derivation_type
+) VALUES (
+    stable_uuid('affiliated_with', 'predicate'),
+    ARRAY[
+        stable_uuid('charles_babbage',          'entity'),
+        stable_uuid('university_of_cambridge',  'entity'),
+        stable_uuid('lucasian_professor',       'entity')
+    ],
+    13.0, 2.0,
+    'empirical', 'interval',
+    ROW(year_to_jd(1828), year_to_jd(1827), year_to_jd(1829), 'year')::fuzzy_time,
+    ROW(year_to_jd(1839), year_to_jd(1838), year_to_jd(1840), 'year')::fuzzy_time,
+    stable_uuid('reality', 'context'),
+    'source_ingested'
+);
+
+
+-- ── C7. Assert: Lovelace was born in London (circa 1815) ──────
+-- [Fix #23] CORRECT PATTERN — uses no_period (not no_scope).
+-- The third arg of located_in is a named time period when a period is
+-- the genuine semantic argument. For a birth-location fact, no named
+-- period is the argument: the temporal scope is expressed in t_start /
+-- t_end. The sentinel for this situation is no_period.
+-- no_scope is restricted to role-scope arguments (see C3).
+--
+-- If you need to express "Lovelace in the Romantic era" and the era is
+-- the genuine semantic argument, use a named period object instead.
+-- A bare year-object or no_scope is wrong in both cases.
+
+INSERT INTO statements (
+    predicate_id, object_args,
+    belief_alpha, belief_beta,
+    statement_kind, t_kind, t_start,
+    context_id, derivation_type
+) VALUES (
+    stable_uuid('located_in', 'predicate'),
+    ARRAY[
+        stable_uuid('ada_lovelace', 'entity'),
+        stable_uuid('london',       'entity'),
+        stable_uuid('no_period',    'entity')   -- [Fix #23] no named period is the arg
+    ],
+    13.0, 2.0,
+    'empirical', 'point',
+    -- t_start encodes the temporal scope: born ≈ 1815, ±1 year fuzzy bound
+    ROW(year_to_jd(1815), year_to_jd(1815), year_to_jd(1816), 'year')::fuzzy_time,
+    stable_uuid('reality', 'context'),
+    'source_ingested'
+);
+
+
+-- ── C8. Assert a has_value fact ───────────────────────────────
+-- has_value(entity, attribute, value)
+-- "The Difference Engine has approximately 25,000 parts."
+
+INSERT INTO objects (id, kind, canonical_name, display_name, description)
+VALUES (
+    stable_uuid('component_count', 'entity'),
+    'entity', 'component_count', 'Component count',
+    'The number of distinct components in a mechanical or electronic system.'
+) ON CONFLICT (canonical_name, kind) DO NOTHING;
+
+INSERT INTO statements (
+    predicate_id, object_args, literal_args,
+    belief_alpha, belief_beta,
+    statement_kind, t_kind, context_id, derivation_type
+) VALUES (
+    stable_uuid('has_value', 'predicate'),
+    ARRAY[
+        stable_uuid('difference_engine', 'entity'),
+        stable_uuid('component_count',   'entity')
+    ],
+    '[{"pos":2,"type":"integer","value":25000}]'::jsonb,
+    8.0, 2.0,
+    'empirical', 'always',
+    stable_uuid('reality', 'context'),
+    'source_ingested'
+);
+
+
+-- ── C9. [Fix #24] Inverse predicate automation ───────────────
+-- part_of ↔ has_part wiring was seeded in common_predicates_kernel.sql.
+-- Inserting part_of(A, B) automatically inserts has_part(B, A) as a
+-- forward_chained statement via trg_zz_auto_inverse_statement.
+-- The inverse statement has derivation_type = 'forward_chained'
+-- and a statement_dependencies row pointing to the source.
+
+INSERT INTO objects (id, kind, canonical_name, display_name, description)
+VALUES (
+    stable_uuid('babbage_workshop', 'entity'),
+    'entity', 'babbage_workshop', 'Babbage''s Workshop',
+    'The mechanical workshop where Babbage constructed the Difference Engine.'
+) ON CONFLICT (canonical_name, kind) DO NOTHING;
+
+-- Insert the forward direction: difference_engine part_of babbage_workshop
+INSERT INTO statements (
+    predicate_id, object_args,
+    belief_alpha, belief_beta,
+    statement_kind, t_kind, context_id, derivation_type
+) VALUES (
+    stable_uuid('part_of', 'predicate'),
+    ARRAY[
+        stable_uuid('difference_engine', 'entity'),
+        stable_uuid('babbage_workshop',  'entity')
+    ],
+    9.0, 3.0,
+    'empirical', 'interval',
+    stable_uuid('reality', 'context'),
+    'user_asserted'
+);
+
+-- Verify the trigger created the inverse automatically.
+SELECT
+    p.canonical_name                               AS predicate,
+    a.canonical_name                               AS arg1,
+    b.canonical_name                               AS arg2,
+    s.derivation_type,
+    s.statement_kind,
+    round(s.belief_mean::numeric, 4)               AS belief
+FROM statements s
+JOIN objects p ON p.id = s.predicate_id
+JOIN objects a ON a.id = s.object_args[1]
+JOIN objects b ON b.id = s.object_args[2]
+WHERE s.predicate_id IN (
+    stable_uuid('part_of',  'predicate'),
+    stable_uuid('has_part', 'predicate')
+)
+  AND (s.object_args[1] = stable_uuid('difference_engine', 'entity')
+    OR s.object_args[2] = stable_uuid('difference_engine', 'entity'))
+ORDER BY p.canonical_name;
+-- Expect: part_of(difference_engine, babbage_workshop) derivation_type='user_asserted'
+--         has_part(babbage_workshop, difference_engine) derivation_type='forward_chained'
+-- Both should have the same belief_mean.
+
+
+-- ════════════════════════════════════════════════════════════
+-- PART D: TEMPORAL QUERIES
+-- holds_at() takes p_threshold and p_min_evidence explicitly.
+-- All calls pass them; defaults are 0.5 and 0.0.
+-- In open_world mode, holds_at() filters on effective_mean from
+-- statement_effective_belief (conflict-penalised), not raw belief_mean.
+-- ════════════════════════════════════════════════════════════
+
+-- ── D1. "Was Lovelace a programmer in 1843?" ─────────────────
+
+SELECT *
+FROM holds_at(
+    stable_uuid('has_role',    'predicate'),
+    ARRAY[
+        stable_uuid('ada_lovelace',      'entity'),
+        stable_uuid('programmer',        'entity'),
+        stable_uuid('difference_engine', 'entity')
+    ],
+    '1843-01-01 00:00:00+00'::timestamptz,
+    stable_uuid('reality', 'context'),
+    'open_world',
+    0.5,   -- p_threshold (applied to effective_mean)
+    0.0    -- p_min_evidence (default)
+);
+-- Expect: one row, belief ≈ 0.867
+
+
+-- ── D2. "Was Lovelace a programmer in 1800?" ─────────────────
+
+SELECT *
+FROM holds_at(
+    stable_uuid('has_role',    'predicate'),
+    ARRAY[
+        stable_uuid('ada_lovelace',      'entity'),
+        stable_uuid('programmer',        'entity'),
+        stable_uuid('difference_engine', 'entity')
+    ],
+    '1800-01-01 00:00:00+00'::timestamptz,
+    stable_uuid('reality', 'context'),
+    'open_world',
+    0.5,
+    0.0
+);
+-- Expect: empty (before she was born)
+
+
+-- ── D3. "Was Babbage at Cambridge in 1835?" ──────────────────
+
+SELECT *
+FROM holds_at(
+    stable_uuid('affiliated_with', 'predicate'),
+    ARRAY[
+        stable_uuid('charles_babbage',         'entity'),
+        stable_uuid('university_of_cambridge', 'entity'),
+        stable_uuid('lucasian_professor',      'entity')
+    ],
+    '1835-06-01 00:00:00+00'::timestamptz,
+    stable_uuid('reality', 'context'),
+    'open_world',
+    0.5,
+    0.0
+);
+-- Expect: one row, belief ≈ 0.867
+
+
+-- ── D4. "Was Babbage at Cambridge in 1850?" ──────────────────
+
+SELECT *
+FROM holds_at(
+    stable_uuid('affiliated_with', 'predicate'),
+    ARRAY[
+        stable_uuid('charles_babbage',         'entity'),
+        stable_uuid('university_of_cambridge', 'entity'),
+        stable_uuid('lucasian_professor',      'entity')
+    ],
+    '1850-01-01 00:00:00+00'::timestamptz,
+    stable_uuid('reality', 'context'),
+    'open_world',
+    0.5,
+    0.0
+);
+-- Expect: empty (chair ended 1839)
+
+
+-- ── D5. "Is person always a subtype of mammal?" ──────────────
+
+SELECT *
+FROM holds_at(
+    stable_uuid('subtype_of', 'predicate'),
+    ARRAY[
+        stable_uuid('person', 'entity'),
+        stable_uuid('mammal', 'entity')
+    ],
+    now(),
+    stable_uuid('reality', 'context'),
+    'open_world',
+    0.5,
+    0.0
+);
+-- Expect: one row, belief ≈ 1.0000, t_kind = 'eternal'
+
+
+-- ── D6. Evidence-weighted mode ────────────────────────────────
+-- Returns all matching statements regardless of effective_mean,
+-- ordered by effective_mean DESC. Useful for the reasoning layer.
+
+SELECT *
+FROM holds_at(
+    stable_uuid('has_role', 'predicate'),
+    ARRAY[
+        stable_uuid('ada_lovelace',  'entity'),
+        stable_uuid('mathematician', 'entity'),
+        stable_uuid('no_scope',      'entity')
+    ],
+    now(),
+    stable_uuid('reality', 'context'),
+    'evidence_weighted',
+    0.5,
+    0.0
+);
+
+
+-- ── D7. Low-threshold query: recover weak but uncontested ─────
+-- Lowering p_threshold to 0.4 captures borderline facts.
+-- p_min_evidence > 2.0 requires more than the uniform prior.
+-- Together: "anything with effective belief > 0.4 backed by real evidence."
+
+SELECT *
+FROM holds_at(
+    stable_uuid('has_role', 'predicate'),
+    ARRAY[
+        stable_uuid('ada_lovelace',  'entity'),
+        stable_uuid('mathematician', 'entity'),
+        stable_uuid('no_scope',      'entity')
+    ],
+    now(),
+    stable_uuid('reality', 'context'),
+    'open_world',
+    0.4,    -- p_threshold: lower than default
+    4.0     -- p_min_evidence: require at least 4 evidence units
+);
+
+
+-- ════════════════════════════════════════════════════════════
+-- PART E: BAYESIAN BELIEF AND TRUST UPDATES
+-- ════════════════════════════════════════════════════════════
+
+-- ── E1. Add a second source and update belief ─────────────────
+
+INSERT INTO objects (id, kind, canonical_name, display_name, description)
+VALUES (
+    stable_uuid('lovelace_biography', 'source'),
+    'source', 'lovelace_biography', 'Ada Lovelace: The Making of a Computer Scientist',
+    'Scholarly biography by Hollings, Martin & Rice (2018).'
+) ON CONFLICT (canonical_name, kind) DO NOTHING;
+
+INSERT INTO source_credibility (source_id, context_id, alpha, beta)
+VALUES (
+    stable_uuid('lovelace_biography', 'source'),
+    stable_uuid('domain_history',     'context'),
+    18.0, 2.0
+) ON CONFLICT DO NOTHING;
+
+INSERT INTO source_credibility (source_id, context_id, alpha, beta)
+VALUES (
+    stable_uuid('lovelace_biography', 'source'),
+    stable_uuid('domain_technology',  'context'),
+    9.0, 3.0
+) ON CONFLICT DO NOTHING;
+
+WITH stmt AS (
+    SELECT id FROM statements
+    WHERE predicate_id   = stable_uuid('has_role', 'predicate')
+      AND object_args[1] = stable_uuid('ada_lovelace',  'entity')
+      AND object_args[2] = stable_uuid('mathematician', 'entity')
+    ORDER BY created_at DESC LIMIT 1
+)
+INSERT INTO attestations (statement_id, source_id, confidence_weight, url)
+SELECT
+    stmt.id,
+    stable_uuid('lovelace_biography', 'source'),
+    1.0,
+    'https://www.bodleian.ox.ac.uk/whats-on/events/2018/october/ada-lovelace-book-launch'
+FROM stmt;
+
+-- Check effective belief before update (raw_mean = effective_mean when no conflicts).
+SELECT
+    round(seb.raw_mean::numeric, 4)            AS raw_belief_before,
+    round(seb.effective_mean::numeric, 4)      AS effective_belief_before,
+    seb.open_conflict_count,
+    s.belief_alpha + s.belief_beta             AS evidence_strength
+FROM statements s
+JOIN statement_effective_belief seb ON seb.id = s.id
+WHERE s.predicate_id   = stable_uuid('has_role', 'predicate')
+  AND s.object_args[1] = stable_uuid('ada_lovelace',  'entity')
+  AND s.object_args[2] = stable_uuid('mathematician', 'entity')
+ORDER BY s.created_at DESC LIMIT 1;
+
+SELECT update_belief(
+    (SELECT id FROM statements
+     WHERE predicate_id   = stable_uuid('has_role', 'predicate')
+       AND object_args[1] = stable_uuid('ada_lovelace',  'entity')
+       AND object_args[2] = stable_uuid('mathematician', 'entity')
+     ORDER BY created_at DESC LIMIT 1),
+    0.90,
+    true
+);
+
+-- Check effective belief after update.
+SELECT
+    round(seb.raw_mean::numeric, 4)            AS raw_belief_after,
+    round(seb.effective_mean::numeric, 4)      AS effective_belief_after,
+    round(seb.conflict_severity::numeric, 4)   AS conflict_severity,
+    s.belief_alpha + s.belief_beta             AS evidence_strength
+FROM statements s
+JOIN statement_effective_belief seb ON seb.id = s.id
+WHERE s.predicate_id   = stable_uuid('has_role', 'predicate')
+  AND s.object_args[1] = stable_uuid('ada_lovelace',  'entity')
+  AND s.object_args[2] = stable_uuid('mathematician', 'entity')
+ORDER BY s.created_at DESC LIMIT 1;
+-- mean rises slightly from ~0.867 to ~0.879.
+-- High prior evidence_strength (15) resists easy revision — correct Bayesian behaviour.
+
+
+-- ── E2. Evidence grouping — correlated sources ───────────────
+-- statement_credibility enforces: each evidence_group_id contributes
+-- at most its single highest-weight attestation to the credibility sum.
+-- Britannica and Wikidata are grouped (both derived from the same
+-- primary sources). Only the higher-weight attestation in the group counts.
+
+INSERT INTO objects (id, kind, canonical_name, display_name)
+VALUES (
+    stable_uuid('encyclopedia_britannica_online', 'source'),
+    'source', 'encyclopedia_britannica_online', 'Encyclopædia Britannica Online'
+) ON CONFLICT (canonical_name, kind) DO NOTHING;
+
+INSERT INTO source_credibility (source_id, context_id, alpha, beta)
+VALUES (
+    stable_uuid('encyclopedia_britannica_online', 'source'),
+    stable_uuid('domain_history', 'context'),
+    15.0, 2.0
+) ON CONFLICT DO NOTHING;
+
+DO $$
+DECLARE
+    group_id uuid := stable_uuid('wikidata_derived_sources', 'source');
+    stmt_id  uuid;
+BEGIN
+    SELECT id INTO stmt_id
+    FROM statements
+    WHERE predicate_id   = stable_uuid('has_role', 'predicate')
+      AND object_args[1] = stable_uuid('ada_lovelace',  'entity')
+      AND object_args[2] = stable_uuid('mathematician', 'entity')
+    ORDER BY created_at DESC LIMIT 1;
+
+    INSERT INTO attestations
+        (statement_id, source_id, evidence_group_id, confidence_weight)
+    VALUES (
+        stmt_id,
+        stable_uuid('encyclopedia_britannica_online', 'source'),
+        group_id,
+        0.7
+    );
+
+    UPDATE attestations
+    SET evidence_group_id = group_id
+    WHERE statement_id = stmt_id
+      AND source_id    = stable_uuid('wikidata', 'source');
+
+    RAISE NOTICE 'Evidence group % assigned. '
+                 'Highest weight in group will dominate credibility sum.', group_id;
+END $$;
+
+-- Verify the group aggregation rule in statement_credibility.
+SELECT
+    sc.statement_id,
+    round(sc.weighted_credibility::numeric, 4)  AS weighted_credibility,
+    round(sc.total_source_weight::numeric, 2)   AS total_weight,
+    sc.source_count
+FROM statement_credibility sc
+JOIN statements s ON s.id = sc.statement_id
+WHERE s.predicate_id   = stable_uuid('has_role', 'predicate')
+  AND s.object_args[1] = stable_uuid('ada_lovelace',  'entity')
+  AND s.object_args[2] = stable_uuid('mathematician', 'entity');
+-- Expect: total_weight reflects only the highest-weight attestation per
+-- group — no inflation from Britannica and Wikidata both counting.
+
+
+-- ── E3. Trust penalty: a source gets something wrong ─────────
+
+SELECT update_trust(
+    stable_uuid('llm_generated', 'source'),
+    stable_uuid('domain_history', 'context'),
+    false,
+    1.0,
+    false
+);
+
+SELECT
+    o.canonical_name                          AS source,
+    c.canonical_name                          AS context,
+    round(scs.mean::numeric, 4)               AS credibility_mean,
+    round(scs.ci_low::numeric, 4)             AS ci_low,
+    round(scs.ci_high::numeric, 4)            AS ci_high,
+    round(scs.evidence_strength::numeric, 1)  AS evidence_strength
+FROM source_credibility_score scs
+JOIN objects o ON o.id = scs.source_id
+JOIN objects c ON c.id = scs.context_id
+WHERE o.canonical_name = 'llm_generated'
+ORDER BY c.canonical_name;
+
+
+-- ── E4. Trust reward: wikidata confirmed correct ──────────────
+
+SELECT update_trust(
+    stable_uuid('wikidata',       'source'),
+    stable_uuid('domain_science', 'context'),
+    true,
+    1.5,
+    false
+);
+
+
+-- ════════════════════════════════════════════════════════════
+-- PART F: DERIVED STATEMENTS AND PROVENANCE
+-- ════════════════════════════════════════════════════════════
+
+-- ── F1. Forward-chain: "Lovelace is a mammal" ────────────────
+-- Chain: lovelace is_a person ∧ person subtype_of mammal
+--        → lovelace is_a mammal
+--
+-- Use compute_derived_belief() instead of a hardcoded belief_alpha.
+-- 'min' mode: result_mean = min(parent_means) * 0.9^chain_length.
+-- Both parents are near-certain (~1.0), so result_mean ≈ 0.9.
+-- [Fix #17] Derived is_a statement uses statement_kind = 'empirical'.
+
+DO $$
+DECLARE
+    ada_id     uuid := stable_uuid('ada_lovelace', 'entity');
+    mammal_id  uuid := stable_uuid('mammal',       'entity');
+    person_id  uuid := stable_uuid('person',       'entity');
+    is_a_id    uuid := stable_uuid('is_a',         'predicate');
+    subtype_id uuid := stable_uuid('subtype_of',   'predicate');
+    reality_id uuid := stable_uuid('reality',      'context');
+    src_stmt_1 uuid;
+    src_stmt_2 uuid;
+    new_stmt   uuid;
+    d_alpha    double precision;
+    d_beta     double precision;
+BEGIN
+    SELECT id INTO src_stmt_1
+    FROM statements
+    WHERE predicate_id = is_a_id
+      AND object_args  = ARRAY[ada_id, person_id]
+    LIMIT 1;
+
+    SELECT id INTO src_stmt_2
+    FROM statements
+    WHERE predicate_id = subtype_id
+      AND object_args  = ARRAY[person_id, mammal_id]
+    LIMIT 1;
+
+    IF src_stmt_1 IS NULL OR src_stmt_2 IS NULL THEN
+        RAISE NOTICE 'Source statements not found; skipping derivation.';
+        RETURN;
+    END IF;
+
+    -- Compute derived belief from parents.
+    -- 'min' mode: result_mean = min(parent_means) * 0.9^1
+    SELECT out_alpha, out_beta
+    INTO d_alpha, d_beta
+    FROM compute_derived_belief(
+        ARRAY[src_stmt_1, src_stmt_2],
+        1,       -- chain length (1 inference step)
+        'min'    -- conservative combination
+    );
+
+    RAISE NOTICE 'compute_derived_belief → alpha=%, beta=% (mean≈%)',
+        round(d_alpha::numeric,4),
+        round(d_beta::numeric,4),
+        round((d_alpha / (d_alpha + d_beta))::numeric,4);
+
+    INSERT INTO statements (
+        predicate_id, object_args,
+        belief_alpha, belief_beta,
+        statement_kind, t_kind, context_id,
+        derivation_type, derivation_depth, derived_from
+    ) VALUES (
+        is_a_id,
+        ARRAY[ada_id, mammal_id],
+        d_alpha, d_beta,
+        'empirical', 'eternal', reality_id,
+        'forward_chained', 1,
+        ARRAY[src_stmt_1, src_stmt_2]
+    )
+    RETURNING id INTO new_stmt;
+
+    -- Authoritative provenance: statement_dependencies is required
+    -- for forward_chained statements (enforced by trg_enforce_provenance).
+    INSERT INTO statement_dependencies (parent_id, child_id, rule_name, weight)
+    VALUES
+        (src_stmt_1, new_stmt, 'is_a + subtype_of → is_a', 1.0),
+        (src_stmt_2, new_stmt, 'is_a + subtype_of → is_a', 1.0);
+
+    RAISE NOTICE 'Derived statement created: % (lovelace is_a mammal, alpha=%)',
+        new_stmt, round(d_alpha::numeric,4);
+END $$;
+
+
+-- ── F2. compute_derived_belief — log_odds mode comparison ─────
+-- [Fix #21] log_odds mode now correctly ACCUMULATES (sums) log-odds
+-- rather than averaging them. Two independent near-certain parents
+-- produce a combined result ABOVE 0.9, reflecting the independence
+-- signal. (In v0.6, averaging gave the same result as a single parent.)
+-- The difference is meaningful when parents have moderate belief (0.6–0.8).
+
+WITH parent_ids AS (
+    SELECT ARRAY[
+        (SELECT id FROM statements
+         WHERE predicate_id = stable_uuid('is_a','predicate')
+           AND object_args  = ARRAY[stable_uuid('ada_lovelace','entity'),
+                                    stable_uuid('person','entity')]
+         LIMIT 1),
+        (SELECT id FROM statements
+         WHERE predicate_id = stable_uuid('subtype_of','predicate')
+           AND object_args  = ARRAY[stable_uuid('person','entity'),
+                                    stable_uuid('mammal','entity')]
+         LIMIT 1)
+    ] AS ids
+)
+SELECT
+    'min (conservative)'    AS strategy,
+    round(out_alpha::numeric,4) AS alpha,
+    round(out_beta::numeric,4)  AS beta,
+    round((out_alpha/(out_alpha+out_beta))::numeric,4) AS mean
+FROM parent_ids, compute_derived_belief(ids, 1, 'min')
+
+UNION ALL
+
+SELECT
+    'log_odds (accumulate)' AS strategy,
+    round(out_alpha::numeric,4),
+    round(out_beta::numeric,4),
+    round((out_alpha/(out_alpha+out_beta))::numeric,4)
+FROM parent_ids, compute_derived_belief(ids, 1, 'log_odds');
+-- Both strategies give similar results when parents are near-certain (~1.0).
+-- With parents at 0.7 each: min → 0.63; log_odds → noticeably higher (independence signal).
+
+
+-- ── F3. Provenance query: all statements about Lovelace ───────
+
+SELECT
+    sv.predicate                                  AS predicate,
+    sv.arg_names                                  AS args,
+    round(sv.belief_mean::numeric, 4)             AS belief,
+    sv.statement_kind,
+    sv.evidence_strength,
+    sv.t_kind,
+    sv.derivation_type,
+    sv.derivation_depth,
+    sv.derived_from
+FROM statement_view sv
+WHERE stable_uuid('ada_lovelace', 'entity') = ANY(sv.object_args)
+ORDER BY sv.belief_mean DESC, sv.derivation_depth;
+
+
+-- ── F4. Provenance: what sources attest a specific claim ──────
+
+SELECT
+    o_pred.canonical_name                                   AS predicate,
+    round(sb.belief_mean::numeric, 4)                       AS belief_mean,
+    s.t_kind,
+    s.derivation_type,
+    s.derivation_depth,
+    array_agg(o_src.canonical_name ORDER BY a.created_at)  AS sources,
+    array_agg(a.confidence_weight  ORDER BY a.created_at)  AS weights,
+    array_agg(a.evidence_group_id  ORDER BY a.created_at)  AS evidence_groups
+FROM statements s
+JOIN statement_belief sb  ON sb.id     = s.id
+JOIN objects o_pred       ON o_pred.id = s.predicate_id
+LEFT JOIN attestations a  ON a.statement_id = s.id
+LEFT JOIN objects o_src   ON o_src.id  = a.source_id
+WHERE s.predicate_id   = stable_uuid('has_role', 'predicate')
+  AND s.object_args[1] = stable_uuid('ada_lovelace',  'entity')
+  AND s.object_args[2] = stable_uuid('mathematician', 'entity')
+GROUP BY s.id, o_pred.canonical_name, sb.belief_mean,
+         s.t_kind, s.derivation_type, s.derivation_depth;
+
+
+-- ── F5. why() — full provenance graph ────────────────────────
+-- Retrieves the recursive explanation tree for the derived
+-- lovelace→mammal statement. Shows depth, rule applied at each
+-- step, and both raw and effective belief at each node.
+
+SELECT
+    w.depth,
+    w.predicate,
+    w.arg_names,
+    round(w.belief_mean::numeric, 4)    AS raw_belief,
+    round(w.effective_mean::numeric, 4) AS effective_belief,
+    w.rule_name,
+    w.edge_weight,
+    w.derivation_type,
+    w.statement_kind
+FROM why(
+    (SELECT id FROM statements
+     WHERE predicate_id  = stable_uuid('is_a', 'predicate')
+       AND object_args   = ARRAY[
+               stable_uuid('ada_lovelace', 'entity'),
+               stable_uuid('mammal',       'entity')]
+       AND derivation_type = 'forward_chained'
+     LIMIT 1)
+) w
+ORDER BY w.depth, w.statement_id;
+-- Expect:
+--   depth 0: is_a(ada_lovelace, mammal)  — the conclusion
+--   depth 1: is_a(ada_lovelace, person)  — parent via is_a+subtype_of rule
+--   depth 1: subtype_of(person, mammal)  — parent via is_a+subtype_of rule
+
+
+-- ════════════════════════════════════════════════════════════
+-- PART G: CONFLICT DETECTION AND RESOLUTION
+-- Evidential opposition is expressed as two competing positive
+-- statements, with a conflicts row linking them. The "opposing"
+-- statement has low alpha and high beta (low belief_mean).
+-- [Fix #19] detect_conflicts() now populates severity (normalised
+-- CI gap) on each inserted conflict row.
+-- [Fix #20] Open conflicts suppress effective_mean in
+-- statement_effective_belief.
+-- ════════════════════════════════════════════════════════════
+
+-- ── G1. Insert a contradictory claim ─────────────────────────
+-- A bad source asserts Lovelace was NOT a mathematician.
+-- Scope arg matches C3 (no_scope).
+-- [Fix #17] statement_kind = 'empirical' on the contradictory claim.
+
+INSERT INTO objects (id, kind, canonical_name, display_name)
+VALUES (
+    stable_uuid('unreliable_blog', 'source'),
+    'source', 'unreliable_blog', 'Unreliable Blog Post'
+) ON CONFLICT (canonical_name, kind) DO NOTHING;
+
+INSERT INTO source_credibility (source_id, context_id, alpha, beta)
+VALUES (
+    stable_uuid('unreliable_blog', 'source'),
+    stable_uuid('domain_history',  'context'),
+    2.0, 5.0
+) ON CONFLICT DO NOTHING;
+
+DO $$
+DECLARE
+    opposing_stmt uuid;
+BEGIN
+    INSERT INTO statements (
+        predicate_id, object_args,
+        belief_alpha, belief_beta,
+        statement_kind, interpretation,
+        t_kind, context_id, derivation_type
+    ) VALUES (
+        stable_uuid('has_role', 'predicate'),
+        ARRAY[
+            stable_uuid('ada_lovelace',  'entity'),
+            stable_uuid('mathematician', 'entity'),
+            stable_uuid('no_scope',      'entity')
+        ],
+        2.0, 5.0,
+        'empirical', 'ontological',
+        'always',
+        stable_uuid('reality', 'context'),
+        'source_ingested'
+    )
+    RETURNING id INTO opposing_stmt;
+
+    INSERT INTO attestations (statement_id, source_id)
+    VALUES (opposing_stmt, stable_uuid('unreliable_blog', 'source'));
+
+    RAISE NOTICE 'Opposing statement %: belief_mean ≈ 0.286 (low-credibility source)',
+        opposing_stmt;
+END $$;
+
+
+-- ── G2. Detect conflicts via detect_conflicts() ───────────────
+-- detect_conflicts() uses CI non-overlap as the criterion and now
+-- populates severity (the normalised CI gap) on each row.
+-- Temporal overlap guard prevents false positives from disjoint
+-- time windows.
+
+SELECT detect_conflicts(stable_uuid('reality', 'context')) AS new_conflicts_inserted;
+-- Expect: 1 (the mathematician-claim pair)
+
+-- Inspect newly detected conflicts including severity.
+SELECT
+    cf.id,
+    cf.conflict_kind,
+    pa.canonical_name                         AS predicate,
+    round(sba.belief_mean::numeric, 4)        AS belief_a,
+    round(sbb.belief_mean::numeric, 4)        AS belief_b,
+    round(ba.ci_high::numeric, 4)             AS ci_high_a,
+    round(bb.ci_low::numeric, 4)              AS ci_low_b,
+    round(cf.severity::numeric, 4)            AS severity,  -- [Fix #19]
+    cf.resolved
+FROM conflicts cf
+JOIN statements    sa   ON sa.id   = cf.statement_a
+JOIN statements    sb_s ON sb_s.id = cf.statement_b
+JOIN objects       pa   ON pa.id   = sa.predicate_id
+JOIN statement_belief sba ON sba.id = cf.statement_a
+JOIN statement_belief sbb ON sbb.id = cf.statement_b
+JOIN statement_belief ba  ON ba.id  = cf.statement_a
+JOIN statement_belief bb  ON bb.id  = cf.statement_b
+WHERE cf.resolved = false
+  AND cf.conflict_kind = 'direct_negation'
+ORDER BY cf.severity DESC, cf.created_at DESC
+LIMIT 5;
+-- Expect: severity > 0; ci_high_a < ci_low_b (CIs do not overlap).
+-- detect_conflicts() skips pairs already in conflicts — safe to call
+-- repeatedly after bulk ingestion.
+
+
+-- ── G3. Register an additional manual conflict ────────────────
+-- detect_conflicts() covers CI-based cases. Register conflicts
+-- manually when domain knowledge identifies evidential opposition
+-- even where CIs overlap.
+
+DO $$
+DECLARE
+    high_id uuid;
+    low_id  uuid;
+BEGIN
+    SELECT id INTO high_id
+    FROM statements
+    WHERE predicate_id   = stable_uuid('has_role', 'predicate')
+      AND object_args[1] = stable_uuid('ada_lovelace',  'entity')
+      AND object_args[2] = stable_uuid('mathematician', 'entity')
+    ORDER BY belief_mean DESC LIMIT 1;
+
+    SELECT id INTO low_id
+    FROM statements
+    WHERE predicate_id   = stable_uuid('has_role', 'predicate')
+      AND object_args[1] = stable_uuid('ada_lovelace',  'entity')
+      AND object_args[2] = stable_uuid('mathematician', 'entity')
+    ORDER BY belief_mean ASC LIMIT 1;
+
+    IF high_id IS NOT NULL AND low_id IS NOT NULL AND high_id <> low_id THEN
+        INSERT INTO conflicts (statement_a, statement_b, conflict_kind)
+        VALUES (high_id, low_id, 'direct_negation')
+        ON CONFLICT DO NOTHING;
+        RAISE NOTICE 'Manual conflict registered: % (high) vs % (low)',
+            high_id, low_id;
+    END IF;
+END $$;
+
+
+-- ── G4. Resolve a conflict ────────────────────────────────────
+
+UPDATE conflicts
+SET resolved        = true,
+    resolution_note = 'Unreliable blog (α=2, β=5, mean≈0.286) outweighed '
+                      'by Wikidata + Lovelace biography (α≈14.9, β≈2, mean≈0.88). '
+                      'High-belief statement retained; low-belief statement '
+                      'remains in KB with its belief unchanged for audit purposes.'
+WHERE conflict_kind = 'direct_negation'
+  AND statement_a IN (
+      SELECT id FROM statements
+      WHERE predicate_id   = stable_uuid('has_role', 'predicate')
+        AND object_args[1] = stable_uuid('ada_lovelace',  'entity')
+        AND object_args[2] = stable_uuid('mathematician', 'entity')
+  );
+
+
+-- ── G5. Soft domain violation example ────────────────────────
+-- trg_z_soft_domain_check fires AFTER INSERT OR UPDATE when a
+-- statement's arg is not a confirmed member of the predicate's
+-- expected arg type (resolved transitively via subtype_of in v0.7).
+-- Hard violations raise an exception; soft violations insert a
+-- type_mismatch conflict (statement_a = statement_b = the statement).
+--
+-- Example: agent_of(difference_engine, something).
+-- agent_of expects an animate entity as arg[1].
+-- difference_engine is an artifact (concrete), not animate.
+-- domain_strictness of agent_of = 'soft' → type_mismatch conflict.
+-- [Fix #22] The check also fires on UPDATE — demonstrated below.
+
+DO $$
+DECLARE
+    bad_stmt uuid;
+BEGIN
+    INSERT INTO statements (
+        predicate_id, object_args,
+        belief_alpha, belief_beta,
+        statement_kind, t_kind, context_id, derivation_type
+    ) VALUES (
+        stable_uuid('agent_of', 'predicate'),
+        ARRAY[
+            stable_uuid('difference_engine', 'entity'),  -- NOT animate
+            stable_uuid('ada_lovelace',      'entity')
+        ],
+        3.0, 2.0,
+        'empirical', 'always',
+        stable_uuid('reality', 'context'),
+        'source_ingested'
+    )
+    RETURNING id INTO bad_stmt;
+
+    RAISE NOTICE 'Soft domain violation statement inserted: %', bad_stmt;
+    RAISE NOTICE 'A type_mismatch conflict should now exist.';
+END $$;
+
+-- Inspect the auto-generated type_mismatch conflict.
+-- statement_a = statement_b = the offending statement (self-referential).
+SELECT
+    cf.id,
+    cf.conflict_kind,
+    cf.resolution_note,
+    cf.resolved,
+    sa.predicate_id,
+    sa.object_args
+FROM conflicts cf
+JOIN statements sa ON sa.id = cf.statement_a
+WHERE cf.conflict_kind = 'type_mismatch'
+  AND cf.statement_a   = cf.statement_b
+ORDER BY cf.created_at DESC
+LIMIT 3;
+-- Expect: one row, conflict_kind='type_mismatch', self-referential.
+-- resolution_note describes which arg and expected type were mismatched
+-- (checked transitively via subtype_of in v0.7).
+
+
+-- ── G6. [Fix #20] Effective belief is penalised by open conflicts ──
+-- After G1 inserted a conflicting statement and before G4 resolved it,
+-- statement_effective_belief penalises the high-belief statement's
+-- effective_mean. This example confirms the penalty is visible.
+
+SELECT
+    round(seb.raw_mean::numeric, 4)            AS raw_mean,
+    round(seb.effective_mean::numeric, 4)      AS effective_mean,
+    seb.open_conflict_count,
+    round(seb.conflict_severity::numeric, 4)   AS max_conflict_severity
+FROM statements s
+JOIN statement_effective_belief seb ON seb.id = s.id
+WHERE s.predicate_id   = stable_uuid('has_role', 'predicate')
+  AND s.object_args[1] = stable_uuid('ada_lovelace',  'entity')
+  AND s.object_args[2] = stable_uuid('mathematician', 'entity')
+ORDER BY s.belief_mean DESC LIMIT 1;
+-- Expect: effective_mean < raw_mean when open conflicts exist.
+-- After G4 resolves the conflict, effective_mean = raw_mean.
+
+
+-- ════════════════════════════════════════════════════════════
+-- PART H: AGGREGATE VIEWS AND INTROSPECTION
+-- ════════════════════════════════════════════════════════════
+
+-- ── H1. Statement counts by t_kind, derivation_type, kind ────
+-- [Fix #17] Includes statement_kind breakdown.
+
+SELECT
+    t_kind,
+    statement_kind,
+    derivation_type,
+    count(*)                                        AS n_statements,
+    round(avg(seb.effective_mean)::numeric, 4)      AS avg_effective_belief
+FROM statements s
+JOIN statement_effective_belief seb ON seb.id = s.id
+GROUP BY t_kind, statement_kind, derivation_type
+ORDER BY t_kind, statement_kind, derivation_type;
+
+
+-- ── H2. tell_about(person) ───────────────────────────────────
+-- "What does the KB know about person?"
+-- tell_about() returns all statements where the entity appears in
+-- any arg position, resolved to canonical names, ordered by
+-- effective_mean (conflict-penalised).
+-- [Fix #20] Now shows effective_mean, raw_mean, open_conflict_count.
+-- [Fix #17] Now shows statement_kind; 'rule' statements excluded.
+
+SELECT
+    predicate,
+    arg_names,
+    round(effective_mean::numeric, 4)    AS effective_belief,
+    round(raw_mean::numeric, 4)          AS raw_belief,
+    open_conflict_count,
+    statement_kind,
+    t_kind,
+    derivation_type
+FROM tell_about(
+    stable_uuid('person', 'entity'),
+    stable_uuid('reality', 'context'),
+    0.0    -- p_threshold: show everything, including kernel axioms
+)
+ORDER BY effective_mean DESC, predicate;
+
+
+-- ── H3. tell_about(ada_lovelace) ─────────────────────────────
+-- Primary "what do we know about X?" query for a named individual.
+
+SELECT
+    predicate,
+    arg_names,
+    round(effective_mean::numeric, 4)    AS effective_belief,
+    round(raw_mean::numeric, 4)          AS raw_belief,
+    open_conflict_count,
+    statement_kind,
+    t_kind,
+    derivation_type,
+    t_start,
+    t_end
+FROM tell_about(
+    stable_uuid('ada_lovelace', 'entity'),
+    stable_uuid('reality', 'context'),
+    0.0
+)
+ORDER BY effective_mean DESC;
+-- Expect: is_a(ada_lovelace, person), is_a(ada_lovelace, mammal) [derived],
+-- has_role(ada_lovelace, mathematician, no_scope),
+-- has_role(ada_lovelace, programmer, difference_engine),
+-- located_in(ada_lovelace, london, no_period) [point, ~1815]
+--                                    ↑ no_period, not no_scope (Fix #23)
+
+
+-- ── H4. [Fix #25] tell_about with p_time ─────────────────────
+-- New in v0.7: restrict to statements whose temporal scope includes
+-- a specific historical moment. What was true about Lovelace in 1842?
+
+SELECT
+    predicate,
+    arg_names,
+    round(effective_mean::numeric, 4)    AS effective_belief,
+    statement_kind,
+    t_kind,
+    t_start,
+    t_end
+FROM tell_about(
+    stable_uuid('ada_lovelace', 'entity'),
+    stable_uuid('reality', 'context'),
+    0.0,
+    '1842-06-01 00:00:00+00'::timestamptz   -- [Fix #25] p_time
+)
+ORDER BY effective_mean DESC;
+-- Expect: eternal/always statements always included; interval statements
+-- that contain 1842 included; statements after 1843 excluded.
+-- has_role(ada_lovelace, programmer, difference_engine) [1842–1843] → included.
+-- t_kind='point' birth-in-london → excluded (point before 1842 interval check).
+
+
+-- ── H5. tell_about with context filter ───────────────────────
+-- Restrict to a specific domain context.
+
+SELECT
+    predicate,
+    arg_names,
+    round(effective_mean::numeric, 4)  AS effective_belief,
+    statement_kind,
+    t_kind
+FROM tell_about(
+    stable_uuid('difference_engine', 'entity'),
+    stable_uuid('domain_technology', 'context'),
+    0.5
+)
+ORDER BY effective_mean DESC;
+
+
+-- ── H6. Source credibility overview ──────────────────────────
+
+SELECT
+    o.canonical_name                          AS source,
+    c.canonical_name                          AS context,
+    round(scs.mean::numeric, 4)               AS credibility_mean,
+    round(scs.ci_low::numeric, 4)             AS ci_low,
+    round(scs.ci_high::numeric, 4)            AS ci_high,
+    round(scs.evidence_strength::numeric, 1)  AS evidence_strength,
+    scs.is_protected
+FROM source_credibility_score scs
+JOIN objects o ON o.id = scs.source_id
+JOIN objects c ON c.id = scs.context_id
+ORDER BY scs.mean DESC, o.canonical_name;
+
+
+-- ── H7. Open conflicts with effective belief impact ───────────
+-- [Fix #19/20] Shows severity and effective_mean suppression side by side.
+
+SELECT
+    cf.id,
+    cf.conflict_kind,
+    round(cf.severity::numeric, 4)                AS severity,
+    pa.canonical_name                              AS predicate_a,
+    round(seba.effective_mean::numeric, 4)         AS effective_mean_a,
+    round(seba.raw_mean::numeric, 4)               AS raw_mean_a,
+    round(sebb.effective_mean::numeric, 4)         AS effective_mean_b,
+    round(sebb.raw_mean::numeric, 4)               AS raw_mean_b,
+    cf.resolved,
+    cf.created_at
+FROM conflicts cf
+JOIN statements    sa   ON sa.id   = cf.statement_a
+JOIN statements    sb_s ON sb_s.id = cf.statement_b
+JOIN objects       pa   ON pa.id   = sa.predicate_id
+JOIN statement_effective_belief seba ON seba.id = cf.statement_a
+JOIN statement_effective_belief sebb ON sebb.id = cf.statement_b
+WHERE cf.resolved = false
+ORDER BY cf.severity DESC NULLS LAST, cf.created_at;
+-- Expect: effective_mean_a < raw_mean_a when conflict is open and severe.
+
+
+-- ── H8. Equivalent objects ────────────────────────────────────
+
+SELECT
+    a.canonical_name                               AS object_a,
+    b.canonical_name                               AS object_b,
+    round((oe.alpha / (oe.alpha + oe.beta))::numeric, 4) AS equiv_belief,
+    oe.alpha + oe.beta                             AS evidence_strength
+FROM object_equivalence oe
+JOIN objects a ON a.id = oe.object_a
+JOIN objects b ON b.id = oe.object_b
+ORDER BY equiv_belief DESC;
+-- Should include: is_a ↔ instance_of (seeded by basis predicates file)
+
+
+-- ════════════════════════════════════════════════════════════
+-- PART I: PYTHON REFERENCE (psycopg2 / asyncpg patterns)
+-- ════════════════════════════════════════════════════════════
+
+/*
+import psycopg2
+
+conn = psycopg2.connect("dbname=your_database")
+cur  = conn.cursor()
+
+# ── Replicate stable_uuid() in Python ────────────────────────
+import hashlib
+def stable_uuid(name: str, kind: str) -> str:
+    key = f"{name}:{kind}"
+    h   = hashlib.md5(key.encode()).hexdigest()
+    return f"{h[:8]}-{h[8:12]}-4{h[13:16]}-{h[16:20]}-{h[20:32]}"
+
+# ── Boolean query using effective belief ─────────────────────
+# [Fix #20] Use statement_effective_belief for conflict-aware belief.
+cur.execute("""
+    SELECT seb.raw_mean, seb.effective_mean, seb.open_conflict_count
+    FROM statements s
+    JOIN statement_effective_belief seb ON seb.id = s.id
+    WHERE s.predicate_id = %s
+      AND s.object_args  = ARRAY[%s::uuid, %s::uuid]
+""", (
+    stable_uuid('subtype_of', 'predicate'),
+    stable_uuid('mammal',     'entity'),
+    stable_uuid('animal',     'entity'),
+))
+row = cur.fetchone()
+if row:
+    print(f"P(mammal subtype_of animal) raw={row[0]:.4f} effective={row[1]:.4f} "
+          f"open_conflicts={row[2]}")
+
+# ── Temporal query ────────────────────────────────────────────
+cur.execute("""
+    SELECT * FROM holds_at(%s, ARRAY[%s::uuid, %s::uuid, %s::uuid],
+                           %s::timestamptz, %s, %s, %s, %s)
+""", (
+    stable_uuid('affiliated_with',         'predicate'),
+    stable_uuid('charles_babbage',         'entity'),
+    stable_uuid('university_of_cambridge', 'entity'),
+    stable_uuid('lucasian_professor',      'entity'),
+    '1835-06-01',
+    stable_uuid('reality', 'context'),
+    'open_world',
+    0.5,   # p_threshold (applied to effective_mean)
+    0.0,   # p_min_evidence
+))
+for row in cur.fetchall():
+    print(f"statement_id={row[0]}  effective_belief={row[1]:.4f}  evidence={row[2]:.1f}")
+
+# ── Assert a type via is_a with statement_kind ───────────────
+# [Fix #17] Include statement_kind = 'empirical' for individual facts.
+cur.execute("""
+    INSERT INTO statements (
+        predicate_id, object_args, belief_alpha, belief_beta,
+        statement_kind, t_kind, context_id, derivation_type
+    ) VALUES (
+        %s, ARRAY[%s::uuid, %s::uuid],
+        1000.0, 0.001, 'empirical', 'eternal', %s, 'user_asserted'
+    ) ON CONFLICT DO NOTHING
+""", (
+    stable_uuid('is_a',        'predicate'),
+    stable_uuid('my_entity',   'entity'),
+    stable_uuid('person',      'entity'),
+    stable_uuid('reality',     'context'),
+))
+conn.commit()
+# type_membership now has a row for (my_entity, person) automatically.
+
+# ── located_in with no_period [Fix #23] ──────────────────────
+# Use no_period for the time_period arg when no named period is intended.
+cur.execute("""
+    INSERT INTO statements (
+        predicate_id, object_args, belief_alpha, belief_beta,
+        statement_kind, t_kind, t_start, context_id, derivation_type
+    ) VALUES (
+        %s,
+        ARRAY[%s::uuid, %s::uuid, %s::uuid],
+        10.0, 1.0,
+        'empirical', 'point',
+        ROW(year_to_jd(1791), year_to_jd(1791), year_to_jd(1792), 'year')::fuzzy_time,
+        %s, 'source_ingested'
+    )
+""", (
+    stable_uuid('located_in',  'predicate'),
+    stable_uuid('my_person',   'entity'),
+    stable_uuid('london',      'entity'),
+    stable_uuid('no_period',   'entity'),   # no named period is the arg
+    stable_uuid('reality',     'context'),
+))
+conn.commit()
+
+# ── tell_about() with p_time [Fix #25] ───────────────────────
+cur.execute("""
+    SELECT predicate, arg_names, effective_mean, raw_mean,
+           statement_kind, t_kind, derivation_type
+    FROM tell_about(%s, %s, %s, %s)
+    ORDER BY effective_mean DESC
+""", (
+    stable_uuid('ada_lovelace', 'entity'),
+    stable_uuid('reality',      'context'),
+    0.0,                          # p_threshold: show everything
+    '1842-06-01',                 # p_time: what held in 1842?
+))
+for row in cur.fetchall():
+    print(f"{row[0]}({', '.join(row[1])}) effective={row[2]:.4f} kind={row[4]}")
+
+# ── why() — with effective_mean per node ─────────────────────
+# [Fix #20] why() now returns effective_mean alongside belief_mean.
+derived_stmt_id = "..."   # UUID of a forward_chained statement
+cur.execute("""
+    SELECT depth, predicate, arg_names, belief_mean, effective_mean,
+           rule_name, edge_weight, statement_kind
+    FROM why(%s)
+    ORDER BY depth, statement_id
+""", (derived_stmt_id,))
+for row in cur.fetchall():
+    indent = "  " * row[0]
+    print(f"{indent}[{row[0]}] {row[1]}({', '.join(row[2] or [])}) "
+          f"raw={row[3]:.4f} effective={row[4]:.4f} rule={row[5]}")
+
+# ── detect_conflicts() with severity ─────────────────────────
+# [Fix #19] Conflicts now carry a severity score.
+cur.execute(
+    "SELECT detect_conflicts(%s) AS new_conflicts",
+    (stable_uuid('reality', 'context'),)
+)
+row = cur.fetchone()
+print(f"New conflicts detected: {row[0]}")
+conn.commit()
+
+# Inspect severity on open conflicts.
+cur.execute("""
+    SELECT cf.conflict_kind, cf.severity,
+           seba.effective_mean, seba.raw_mean
+    FROM conflicts cf
+    JOIN statement_effective_belief seba ON seba.id = cf.statement_a
+    WHERE cf.resolved = false
+    ORDER BY cf.severity DESC NULLS LAST
+    LIMIT 10
+""")
+for row in cur.fetchall():
+    print(f"kind={row[0]} severity={row[1]:.4f} "
+          f"effective={row[2]:.4f} raw={row[3]:.4f}")
+
+# ── compute_derived_belief() — log_odds now accumulates ───────
+# [Fix #21] Two independent 0.7-belief parents now yield > 0.63.
+cur.execute("""
+    SELECT out_alpha, out_beta
+    FROM compute_derived_belief(%s, %s, %s)
+""", (
+    [parent_id_1, parent_id_2],  # list of parent statement UUIDs
+    1,                           # chain length
+    'log_odds',                  # accumulate, not average
+))
+alpha, beta = cur.fetchone()
+mean = alpha / (alpha + beta)
+print(f"Derived belief: alpha={alpha:.4f}, beta={beta:.4f}, mean={mean:.4f}")
+
+# ── Bayesian belief update ───────────────────────────────────
+cur.execute("SELECT update_belief(%s, %s, %s)", (statement_id, 0.90, True))
+conn.commit()
+
+# ── Trust update ─────────────────────────────────────────────
+cur.execute(
+    "SELECT update_trust(%s, %s, %s, %s, %s)",
+    (
+        stable_uuid('wikidata',       'source'),
+        stable_uuid('domain_history', 'context'),
+        True,   # correct
+        1.0,    # weight
+        False,  # p_override: not protected
+    )
+)
+conn.commit()
+*/
